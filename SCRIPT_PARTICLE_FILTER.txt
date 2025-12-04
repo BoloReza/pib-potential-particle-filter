@@ -1,0 +1,160 @@
+import numpy as np
+import pandas as pd
+
+def particle_filter_pib_potential(
+    input_path="Serie.xlsx",
+    output_path="PIB_potencial_particle_filter_HP_like.xlsx",
+    sheet_name=0,
+    year_col="Años",
+    pib_col="PIB",
+    r=1.0,          # razón sigma_eps^2 / sigma_eta^2 (calibración HP-like)
+    N=4000,         # número de partículas
+    seed=0          # semilla aleatoria para reproducibilidad
+):
+    """
+    Estima el PIB potencial mediante un filtro de partículas (modelo de nivel local)
+    y guarda un archivo Excel con el resultado.
+
+    Parámetros
+    ----------
+    input_path : str
+        Ruta del archivo Excel con la serie de PIB (por defecto 'Serie.xlsx').
+    output_path : str
+        Ruta del archivo Excel de salida.
+    sheet_name : int o str
+        Nombre o índice de la hoja de Excel a leer.
+    year_col : str
+        Nombre de la columna que contiene los años.
+    pib_col : str
+        Nombre de la columna que contiene el PIB en niveles.
+    r : float
+        Razón de varianzas r = sigma_eps^2 / sigma_eta^2.
+    N : int
+        Número de partículas del filtro.
+    seed : int
+        Semilla aleatoria para reproducibilidad.
+
+    Devuelve
+    --------
+    df_result : pandas.DataFrame
+        DataFrame con Año, PIB observado, PIB potencial y brecha del producto.
+    sigma_eps2 : float
+        Varianza del error de medición.
+    sigma_eta2 : float
+        Varianza de la innovación de la tendencia.
+    """
+
+    # -------------------------------------------------------------------------
+    # 1. Cargar datos
+    # -------------------------------------------------------------------------
+    df = pd.read_excel(input_path, sheet_name=sheet_name)
+    # Limpiar espacios en blanco en nombres de columnas
+    df.columns = [c.strip() for c in df.columns]
+
+    years = df[year_col].values
+    y_obs = df[pib_col].astype(float).values
+
+    # Transformar a logaritmos
+    log_y = np.log(y_obs)
+    T = len(log_y)
+
+    # -------------------------------------------------------------------------
+    # 2. Calibración de varianzas usando la varianza del crecimiento en log
+    # -------------------------------------------------------------------------
+    dy = np.diff(log_y)
+    # Varianza muestral (ddof=1) – puedes usar ddof=0 si prefieres
+    var_dy = np.var(dy, ddof=1)
+
+    # A partir de:
+    #   Var(Δy) = 2 * sigma_eps^2 + sigma_eta^2
+    #   r = sigma_eps^2 / sigma_eta^2
+    # se obtiene:
+    sigma_eta2 = var_dy / (2.0 * r + 1.0)
+    sigma_eps2 = r * sigma_eta2
+
+    sigma_eta = np.sqrt(sigma_eta2)
+    sigma_eps = np.sqrt(sigma_eps2)
+
+    print("Calibración:")
+    print(f"  r              = {r}")
+    print(f"  var(Δlog PIB)  = {var_dy:.6e}")
+    print(f"  sigma_eps^2    = {sigma_eps2:.6e}")
+    print(f"  sigma_eta^2    = {sigma_eta2:.6e}")
+
+    # -------------------------------------------------------------------------
+    # 3. Filtro de partículas (bootstrap particle filter)
+    # -------------------------------------------------------------------------
+    np.random.seed(seed)
+
+    # Inicializar partículas alrededor del primer valor log_y[0]
+    mu_particles = np.random.normal(loc=log_y[0], scale=0.01, size=N)
+    w = np.ones(N) / N
+
+    mu_hat = np.zeros(T)
+
+    def gaussian_likelihood(x, mean, sigma):
+        """
+        Densidad de una normal N(mean, sigma^2) evaluada en x.
+        x y mean pueden ser arrays, sigma un escalar.
+        """
+        return np.exp(-0.5 * ((x - mean) / sigma) ** 2) / (
+            np.sqrt(2.0 * np.pi) * sigma
+        )
+
+    for t in range(T):
+        # 3.1. Predicción: propagar partículas según la ecuación de estado
+        if t > 0:
+            mu_particles = mu_particles + np.random.normal(0.0, sigma_eta, size=N)
+
+        # 3.2. Actualización de pesos: ecuación de medición
+        lik = gaussian_likelihood(log_y[t], mu_particles, sigma_eps)
+        w *= lik
+
+        w_sum = np.sum(w)
+        if (w_sum == 0.0) or (not np.isfinite(w_sum)):
+            # En caso de degeneración numérica, resetear pesos
+            w = np.ones(N) / N
+        else:
+            w /= w_sum
+
+        # 3.3. Estimación filtrada del estado (media ponderada)
+        mu_hat[t] = np.sum(w * mu_particles)
+
+        # 3.4. Remuestreo sistemático (systematic resampling)
+        positions = (np.arange(N) + np.random.rand()) / N
+        cumulative_sum = np.cumsum(w)
+        cumulative_sum[-1] = 1.0  # para evitar problemas de redondeo
+
+        indices = np.searchsorted(cumulative_sum, positions)
+        mu_particles = mu_particles[indices]
+        w.fill(1.0 / N)
+
+    # -------------------------------------------------------------------------
+    # 4. Reconstruir PIB potencial en niveles y brecha del producto
+    # -------------------------------------------------------------------------
+    pib_pot = np.exp(mu_hat)
+    output_gap = (y_obs - pib_pot) / pib_pot * 100.0
+
+    df_result = pd.DataFrame({
+        "Año": years,
+        "PIB_observado": y_obs,
+        "PIB_potencial_particle_filter": pib_pot,
+        "Brecha_output_gap_%": output_gap
+    })
+
+    # -------------------------------------------------------------------------
+    # 5. Guardar resultado a Excel
+    # -------------------------------------------------------------------------
+    df_result.to_excel(output_path, index=False)
+    print(f"\nResultado guardado en: {output_path}")
+
+    # Resumen de la brecha del producto
+    print("\nEstadísticos de la brecha del producto (%):")
+    print(df_result["Brecha_output_gap_%"].describe())
+
+    return df_result, sigma_eps2, sigma_eta2
+
+
+if __name__ == "__main__":
+    # Ejecución por defecto: lee 'Serie.xlsx' y escribe el archivo de salida
+    particle_filter_pib_potential()
